@@ -35,6 +35,148 @@ Total Amount: $21,000.00
     assert invoice_view["lineItems"][0]["sku"]["value"] == "18-999"
 
 
+def test_extract_invoice_view_supports_extension_and_broadcast_quantity_headers() -> None:
+    manifest = _sample_manifest(
+        "<table><tbody>"
+        "<tr>"
+        "<td>Dates</td>"
+        "<td># of Broadcasts</td>"
+        "<td>Description</td>"
+        "<td>Unit Amount</td>"
+        "<td>Extension</td>"
+        "</tr>"
+        "<tr>"
+        "<td>10/24/16-10/28/16</td>"
+        "<td>10</td>"
+        "<td>:30 WYQE SPOTS</td>"
+        "<td>25.00</td>"
+        "<td>250.00</td>"
+        "</tr>"
+        "</tbody></table>"
+    )
+
+    invoice_view = extract_invoice_view(manifest)
+
+    assert len(invoice_view["lineItems"]) == 1
+    assert invoice_view["lineItems"][0]["quantity"]["value"] == "10"
+    assert invoice_view["lineItems"][0]["description"]["value"] == ":30 WYQE SPOTS"
+    assert invoice_view["lineItems"][0]["amount"]["value"] == "250"
+
+
+def test_extract_invoice_view_supports_schedule_tables_without_amount_columns() -> None:
+    manifest = _sample_manifest(
+        "<table><tbody>"
+        "<tr>"
+        "<td>Day</td>"
+        "<td>Date</td>"
+        "<td>Time</td>"
+        "<td>Len</td>"
+        "<td>Line #</td>"
+        "<td>Rate</td>"
+        "<td>CI</td>"
+        "<td>Product</td>"
+        "</tr>"
+        "<tr>"
+        "<td>Thu</td>"
+        "<td>07/26/18</td>"
+        "<td>6:18AM</td>"
+        "<td>60</td>"
+        "<td>763505</td>"
+        "<td>$10.00</td>"
+        "<td>B</td>"
+        "<td>PANCAKES W THE CANDIDATES</td>"
+        "</tr>"
+        "<tr>"
+        "<td>Fri</td>"
+        "<td>07/27/18</td>"
+        "<td>7:01AM</td>"
+        "<td>60</td>"
+        "<td>763506</td>"
+        "<td>$10.00</td>"
+        "<td>B</td>"
+        "<td>PANCAKES W THE CANDIDATES</td>"
+        "</tr>"
+        "</tbody></table>"
+    )
+
+    invoice_view = extract_invoice_view(manifest)
+
+    assert len(invoice_view["lineItems"]) == 2
+    assert invoice_view["lineItems"][0]["description"]["value"] == "PANCAKES W THE CANDIDATES"
+    assert invoice_view["lineItems"][0]["unitPrice"]["value"] == "10"
+    assert invoice_view["lineItems"][0]["itemCode"]["value"] == "763505"
+    assert invoice_view["lineItems"][0]["sku"]["value"] == "763505"
+
+
+def test_extract_invoice_view_pairs_invoice_header_table_columns() -> None:
+    manifest = _sample_manifest(
+        """
+<table>
+  <thead>
+    <tr><th>NUMBER</th><th>INVOICE DATE</th><th>TERMS</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>955041</td><td>June 7, 1999</td><td>NET 10 DAYS</td></tr>
+  </tbody>
+</table>
+"""
+    )
+
+    invoice_view = extract_invoice_view(manifest)
+
+    assert invoice_view["document"]["invoiceNumber"]["value"] == "955041"
+    assert invoice_view["document"]["invoiceDate"]["value"] == "1999-06-07"
+
+
+def test_extract_invoice_view_ignores_substring_label_matches() -> None:
+    manifest = _sample_manifest(
+        """
+Innovative Resource Group, Inc.
+Tel 412-781-7400 Fax 412-781-6794
+"""
+    )
+
+    invoice_view = extract_invoice_view(manifest)
+
+    assert invoice_view["summary"]["tax"]["status"] == "absent"
+
+
+def test_extract_invoice_view_preserves_multiline_bill_to_name_block() -> None:
+    manifest = _sample_manifest(
+        """
+<table border="1"><tr><td>BILL TO</td></tr><tr><td>Mr. Jeff Falvo
+Marketing Information &amp; Planning
+Philip Morris USA
+120 Park Avenue
+New York, NY 10017</td></tr></table>
+"""
+    )
+
+    invoice_view = extract_invoice_view(manifest)
+
+    assert (
+        invoice_view["document"]["customerName"]["value"]
+        == "Mr. Jeff Falvo Marketing Information & Planning Philip Morris USA"
+    )
+
+
+def test_extract_invoice_view_does_not_treat_number_of_hours_as_invoice_number() -> None:
+    manifest = _sample_manifest(
+        """
+IN ACCOUNT WITH
+POWELL, GOLDSTEIN, FRAZER MURPHY LLP
+<table border="1">
+  <tr><td>Description</td><td>Number of Hours</td><td>Hourly Rate</td><td>Total Fee</td></tr>
+</table>
+"""
+    )
+
+    invoice_view = extract_invoice_view(manifest)
+
+    assert invoice_view["document"]["invoiceNumber"]["status"] == "absent"
+    assert invoice_view["document"]["sellerName"]["value"] == "POWELL, GOLDSTEIN, FRAZER MURPHY LLP"
+
+
 def test_compare_artifacts_to_ground_truth_writes_report_and_summary(tmp_path: Path) -> None:
     dataset_dir = tmp_path / "dataset"
     dataset_dir.mkdir()

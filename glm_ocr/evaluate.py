@@ -72,14 +72,52 @@ SUMMARY_LABELS = {
     "totalAmount": ("total amount", "amount due", "total due", "invoice total", "total"),
 }
 LINE_ITEM_HEADERS = {
-    "description": ("description", "product/description", "product description", "details"),
-    "quantity": ("quantity", "qty"),
-    "unitPrice": ("unit price", "price", "unit cost", "rate"),
-    "amount": ("ext. price", "extended price", "amount", "line total", "total"),
+    "description": (
+        "description",
+        "product/description",
+        "product description",
+        "product",
+        "item description",
+        "item",
+        "service",
+        "details",
+        "particulars",
+    ),
+    "quantity": (
+        "quantity",
+        "qty",
+        "# of broadcasts",
+        "broadcasts",
+        "# of spots",
+        "spots",
+        "units",
+    ),
+    "unitPrice": ("unit price", "unit amount", "price", "unit cost", "rate"),
+    "amount": (
+        "ext. price",
+        "extended price",
+        "ext price",
+        "extension",
+        "extension amount",
+        "amount",
+        "line total",
+        "total",
+    ),
     "tax": ("tax",),
     "taxRate": ("tax rate", "vat %", "tax %", "rate %"),
     "sku": ("sku",),
-    "itemCode": ("item code", "code", "item no", "item #", "product code"),
+    "itemCode": (
+        "item code",
+        "code",
+        "item no",
+        "item #",
+        "product code",
+        "line #",
+        "line no",
+        "line number",
+        "reference",
+        "reference #",
+    ),
 }
 LABEL_SYNONYMS = {
     "invoiceNumber": ("invoice number", "invoice no", "invoice #", "inv no", "inv #"),
@@ -89,7 +127,15 @@ LABEL_SYNONYMS = {
 TABLE_FIELD_LABELS = {
     "invoiceNumber": ("invoice number", "invoice #", "invoice no", "document number", "number"),
     "invoiceDate": ("invoice date", "document date", "date"),
-    "sellerName": ("seller", "vendor", "property", "send payment to", "remit to", "from"),
+    "sellerName": (
+        "seller",
+        "vendor",
+        "property",
+        "send payment to",
+        "remit to",
+        "from",
+        "in account with",
+    ),
     "customerName": ("bill to", "sold to", "customer", "account", "advertiser", "to"),
     "subtotal": ("subtotal", "sub total"),
     "tax": ("tax", "vat"),
@@ -340,7 +386,11 @@ def extract_invoice_view(manifest: dict[str, Any]) -> dict[str, Any]:
             table_pairs=table_pairs,
             line_pairs=line_pairs,
         ),
-        "sellerName": _extract_seller_name(merged_lines, table_pairs=table_pairs),
+        "sellerName": _extract_seller_name(
+            merged_lines,
+            table_pairs=table_pairs,
+            line_pairs=line_pairs,
+        ),
         "customerName": _extract_customer_name(
             merged_lines,
             table_pairs=table_pairs,
@@ -479,14 +529,24 @@ def _extract_region_lines(manifest: dict[str, Any]) -> list[str]:
 def _extract_table_pairs(tables: list[TableData]) -> dict[str, list[str]]:
     pairs: dict[str, list[str]] = {}
     for table in tables:
-        for row in [table.headers, *table.rows]:
+        if table.headers and table.rows and len(table.headers) == len(table.rows[0]):
+            for header, value in zip(table.headers, table.rows[0], strict=False):
+                _append_pair(pairs, header, value)
+            remaining_rows = table.rows[1:]
+        else:
+            remaining_rows = table.rows
+        all_rows = [table.headers, *table.rows]
+        single_column_rows = [row[0] for row in all_rows if len(row) == 1 and row[0]]
+        if len(single_column_rows) >= 2 and len(single_column_rows) == len(all_rows):
+            for index in range(0, len(single_column_rows) - 1, 2):
+                _append_pair(pairs, single_column_rows[index], single_column_rows[index + 1])
+            continue
+        for row in remaining_rows:
             cells = [cell for cell in row if cell]
-            if len(cells) < 2:
-                continue
             if len(cells) == 2:
                 _append_pair(pairs, cells[0], cells[1])
                 continue
-            if len(cells) % 2 == 0:
+            if len(cells) % 2 == 0 and not table.headers:
                 for index in range(0, len(cells), 2):
                     _append_pair(pairs, cells[index], cells[index + 1])
     return pairs
@@ -495,16 +555,23 @@ def _extract_table_pairs(tables: list[TableData]) -> dict[str, list[str]]:
 def _extract_line_pairs(lines: list[str]) -> dict[str, list[str]]:
     pairs: dict[str, list[str]] = {}
     for index, line in enumerate(lines):
-        lowered = line.casefold()
         for labels in TABLE_FIELD_LABELS.values():
-            matched_label = next((label for label in labels if label in lowered), None)
+            matched_label = next(
+                (label for label in labels if _line_has_explicit_label(line, label)),
+                None,
+            )
             if matched_label is None:
                 continue
             value = _value_after_label(line, labels)
             if value:
                 _append_pair(pairs, matched_label, value)
                 continue
-            block = _block_after_label(lines, index=index, labels=labels, max_lines=1)
+            block = _block_after_label(
+                lines,
+                index=index,
+                labels=labels,
+                max_lines=3 if labels == TABLE_FIELD_LABELS["customerName"] else 1,
+            )
             if block:
                 _append_pair(pairs, matched_label, block)
     return pairs
@@ -523,12 +590,12 @@ def _extract_labeled_field(
             return candidate
     labels = LABEL_SYNONYMS[field_name]
     for index, line in enumerate(lines):
-        lowered = line.casefold()
-        if any(label in lowered for label in labels):
-            max_lines = 1 if field_name in {"invoiceNumber", "invoiceDate"} else 2
-            block = _block_after_label(lines, index=index, labels=labels, max_lines=max_lines)
-            if block:
-                return _present_field(field_name, block)
+        if not any(_line_has_explicit_label(line, label) for label in labels):
+            continue
+        max_lines = 1 if field_name in {"invoiceNumber", "invoiceDate"} else 2
+        block = _block_after_label(lines, index=index, labels=labels, max_lines=max_lines)
+        if block:
+            return _present_field(field_name, block)
     return _absent_field()
 
 
@@ -536,10 +603,12 @@ def _extract_seller_name(
     lines: list[str],
     *,
     table_pairs: dict[str, list[str]] | None = None,
+    line_pairs: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
-    candidate = _field_from_pairs("sellerName", table_pairs)
-    if candidate["status"] == "present":
-        return candidate
+    for pairs in (table_pairs, line_pairs):
+        candidate = _field_from_pairs("sellerName", pairs)
+        if candidate["status"] == "present":
+            return _party_field("sellerName", candidate["raw"])
     for line in lines:
         lowered = line.casefold()
         if any(
@@ -552,6 +621,8 @@ def _extract_seller_name(
                 "customer",
                 "advertiser",
                 "account",
+                "sold ",
+                "ship ",
                 "send payment to",
                 "remit to",
             )
@@ -561,7 +632,7 @@ def _extract_seller_name(
             continue
         if len(line.split()) < 2:
             continue
-        return _present_field("sellerName", line)
+        return _party_field("sellerName", line)
     return _absent_field()
 
 
@@ -578,7 +649,7 @@ def _extract_customer_name(
         line_pairs=line_pairs,
     )
     if labeled["status"] == "present":
-        return labeled
+        return _party_field("customerName", labeled["raw"])
     invoice_index = next(
         (idx for idx, line in enumerate(lines) if "invoice number" in line.casefold()),
         len(lines),
@@ -598,7 +669,9 @@ def _extract_customer_name(
         if len(line.split()) < 2:
             continue
         if line.isupper() or sum(ch.isupper() for ch in line) >= max(4, len(line) // 3):
-            return _present_field("customerName", line.split("ATTN:")[0].strip())
+            if line.casefold() in {"in account with", "invoice", "to"}:
+                continue
+            return _party_field("customerName", line.split("ATTN:")[0].strip())
     return _absent_field()
 
 
@@ -682,8 +755,7 @@ def _extract_summary_field(
         if candidate["status"] == "present":
             return candidate
     for index, line in enumerate(lines):
-        lowered = line.casefold()
-        if not any(label in lowered for label in labels):
+        if not any(_line_has_explicit_label(line, label) for label in labels):
             continue
         candidate = _value_after_label(line, labels)
         if candidate:
@@ -703,8 +775,7 @@ def _extract_line_items(tables: list[TableData]) -> list[dict[str, Any]]:
         if not headers:
             continue
         mapping = _column_mapping(headers)
-        score = len(mapping)
-        if score < 3 or "amount" not in mapping:
+        if not _is_line_item_candidate(mapping):
             continue
         for item in _rows_to_line_items(rows, mapping):
             row_text = item.get("_row_text", "")
@@ -737,12 +808,26 @@ def _column_mapping(headers: list[str]) -> dict[str, int]:
     mapping: dict[str, int] = {}
     for index, header in enumerate(headers):
         lowered = _collapse_ws(header).casefold()
+        best_field: str | None = None
+        best_alias_length = -1
         for field_name, aliases in LINE_ITEM_HEADERS.items():
             if field_name in mapping:
                 continue
-            if any(alias in lowered for alias in aliases):
-                mapping[field_name] = index
+            alias_length = max((len(alias) for alias in aliases if alias in lowered), default=-1)
+            if alias_length > best_alias_length:
+                best_field = field_name
+                best_alias_length = alias_length
+        if best_field is not None:
+            mapping[best_field] = index
     return mapping
+
+
+def _is_line_item_candidate(mapping: dict[str, int]) -> bool:
+    if len(mapping) < 2:
+        return False
+    has_descriptor = any(field in mapping for field in ("description", "itemCode", "sku"))
+    has_measure = any(field in mapping for field in ("amount", "unitPrice", "quantity"))
+    return has_descriptor and has_measure
 
 
 def _rows_to_line_items(rows: list[list[str]], mapping: dict[str, int]) -> list[dict[str, Any]]:
@@ -773,6 +858,22 @@ def _rows_to_line_items(rows: list[list[str]], mapping: dict[str, int]) -> list[
                     item["sku"] = _present_field("sku", code)
                 if item["itemCode"]["status"] == "absent":
                     item["itemCode"] = _present_field("itemCode", code)
+        if item["sku"]["status"] == "absent" and item["itemCode"]["status"] == "present":
+            item["sku"] = _present_field("sku", item["itemCode"]["raw"])
+        if item["itemCode"]["status"] == "absent" and item["sku"]["status"] == "present":
+            item["itemCode"] = _present_field("itemCode", item["sku"]["raw"])
+        if (
+            item["amount"]["status"] == "absent"
+            and item["quantity"]["status"] == "present"
+            and item["unitPrice"]["status"] == "present"
+        ):
+            try:
+                quantity = Decimal(str(item["quantity"]["value"]))
+                unit_price = Decimal(str(item["unitPrice"]["value"]))
+            except InvalidOperation:
+                pass
+            else:
+                item["amount"] = _present_field("amount", str(quantity * unit_price))
         if meaningful:
             items.append(item)
     return items
@@ -794,6 +895,11 @@ def _field_from_pairs(
     return _absent_field()
 
 
+def _party_field(field_name: str, raw_value: str) -> dict[str, Any]:
+    cleaned = _party_name_block(raw_value)
+    return _present_field(field_name, cleaned)
+
+
 def _append_pair(pairs: dict[str, list[str]], key: str, value: str) -> None:
     normalized = _normalize_label(key)
     cleaned_value = _collapse_ws(value)
@@ -806,6 +912,23 @@ def _normalize_label(value: str) -> str:
     lowered = _collapse_ws(value).casefold()
     lowered = re.sub(r"[^a-z0-9]+", " ", lowered)
     return _collapse_ws(lowered)
+
+
+def _line_has_explicit_label(line: str, label: str) -> bool:
+    escaped = re.escape(label)
+    match = re.search(
+        rf"^\s*(?<!\w){escaped}(?!\w)(.*)$",
+        line,
+        flags=re.I,
+    )
+    if not match:
+        return False
+    suffix = match.group(1)
+    if " " not in label and suffix and not re.match(r"^\s*[:#-]", suffix):
+        candidate = _collapse_ws(suffix)
+        if candidate[:1].islower():
+            return False
+    return True
 
 
 def _block_after_label(
@@ -840,6 +963,22 @@ def _is_address_like(value: str) -> bool:
         token in value.casefold()
         for token in ("st", "road", "ave", "suite", "po box", "floor", "ct")
     )
+
+
+def _party_name_block(value: str) -> str:
+    normalized = re.sub(r"\bP\.?\s*O\.?\s+Box\b", "\nP.O. Box", str(value), flags=re.I)
+    normalized = re.sub(r"\b(\d{1,6}\s+[A-Za-z])", r"\n\1", normalized, count=1)
+    lines = [_collapse_ws(part) for part in normalized.splitlines()]
+    selected: list[str] = []
+    for line in lines:
+        if not line:
+            continue
+        if _is_address_like(line) or re.match(r"^(tel|phone|fax|page)\b", line, flags=re.I):
+            break
+        selected.append(line)
+        if len(selected) >= 3:
+            break
+    return _collapse_ws(" ".join(selected)) if selected else _collapse_ws(str(value))
 
 
 def _unique_lines(lines: list[str]) -> list[str]:
@@ -939,6 +1078,8 @@ def _value_after_label(line: str, labels: tuple[str, ...]) -> str | None:
         if not match:
             continue
         candidate = _collapse_ws(match.group(1))
+        if " " not in label and ":" not in line and "-" not in line and candidate[:1].islower():
+            continue
         if candidate and not _looks_like_label_only(candidate):
             return candidate
     return None
@@ -986,7 +1127,18 @@ def _normalize_value(field_name: str, value: Any) -> Any:
 
 def _normalize_date_value(value: Any) -> str:
     raw = _collapse_ws(str(value))
-    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%d/%m/%Y", "%d.%m.%Y", "%Y/%m/%d"):
+    for fmt in (
+        "%Y-%m-%d",
+        "%m/%d/%Y",
+        "%m/%d/%y",
+        "%d/%m/%Y",
+        "%d.%m.%Y",
+        "%Y/%m/%d",
+        "%B %d, %Y",
+        "%B %d,%Y",
+        "%b %d, %Y",
+        "%b %d,%Y",
+    ):
         try:
             return datetime.strptime(raw, fmt).date().isoformat()
         except ValueError:
