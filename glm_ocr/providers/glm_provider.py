@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import importlib
 import importlib.metadata
-import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
 from urllib import error, request
 
@@ -63,6 +61,11 @@ class DeterminismStrategy:
 
 @dataclass(slots=True)
 class GlmOcrProvider:
+    _parser: Any | None = None
+    _parser_warning: str | None = None
+    _parser_applied: bool = False
+    _parser_initializations: int = 0
+
     def validate_environment(self, settings: OcrSettings) -> list[str]:
         warnings: list[str] = []
         version = self.provider_metadata()["provider_version"]
@@ -88,60 +91,105 @@ class GlmOcrProvider:
             "supported_version_range": SUPPORTED_GLMOCR_VERSION_RANGE,
         }
 
+    def begin_run(self, settings: OcrSettings, budget: ExecutionBudget) -> None:
+        if self._parser is not None:
+            return
+        self._parser_initializations = 0
+        module = self._import_glmocr()
+        parser = module.GlmOcr(
+            mode="selfhosted",
+            model=settings.model,
+            api_url=settings.api_url,
+            layout_device=settings.layout_device,
+            _dotted={
+                "pipeline.maas.enabled": False,
+                "pipeline.ocr_api.api_url": settings.api_url,
+                "pipeline.ocr_api.api_mode": settings.api_mode,
+                "pipeline.ocr_api.api_path": settings.api_path,
+                "pipeline.ocr_api.model": settings.model,
+                "pipeline.ocr_api.request_timeout": 300,
+                "pipeline.ocr_api.connect_timeout": 30,
+                "pipeline.ocr_api.connection_pool_size": max(budget.provider_max_workers, 32),
+                "pipeline.page_loader.max_tokens": settings.page_loader_max_tokens,
+                "pipeline.page_loader.temperature": settings.temperature,
+                "pipeline.page_loader.top_p": settings.top_p,
+                "pipeline.page_loader.top_k": settings.top_k,
+                "pipeline.page_loader.repetition_penalty": settings.repeat_penalty,
+                "pipeline.page_loader.pdf_dpi": settings.pdf_dpi,
+                "pipeline.layout.use_polygon": settings.layout_use_polygon,
+                "pipeline.max_workers": budget.provider_max_workers,
+            },
+        )
+        strategy = DeterminismStrategy(strict=not settings.best_effort_determinism)
+        applied, warning = strategy.apply(parser, settings.seed)
+        self._parser = parser
+        self._parser_applied = applied
+        self._parser_warning = warning
+        self._parser_initializations += 1
+
+    def end_run(self) -> None:
+        if self._parser is not None:
+            self._parser.close()
+        self._parser = None
+        self._parser_warning = None
+        self._parser_applied = False
+
+    def run_telemetry(self) -> dict[str, object]:
+        return {"parser_initializations": self._parser_initializations}
+
     def parse_document(
         self,
         document: DocumentInput,
         settings: OcrSettings,
         budget: ExecutionBudget,
     ) -> ProviderParseResult:
-        module = self._import_glmocr()
-        parser = module.GlmOcr(
-            mode="selfhosted",
-            model=settings.model,
-            layout_device=settings.layout_device,
-            _dotted={
-                "pipeline.ocr_api.api_url": settings.api_url,
-                "pipeline.ocr_api.api_mode": "ollama_generate",
-                "pipeline.ocr_api.request_timeout": 300,
-                "pipeline.ocr_api.connect_timeout": 30,
-                "pipeline.page_loader.max_tokens": settings.page_loader_max_tokens,
-                "pipeline.page_loader.temperature": settings.temperature,
-                "pipeline.page_loader.top_p": settings.top_p,
-                "pipeline.page_loader.top_k": settings.top_k,
-                "pipeline.page_loader.repetition_penalty": settings.repeat_penalty,
-                "pipeline.max_workers": budget.provider_max_workers,
-            },
-        )
-        strategy = DeterminismStrategy(strict=not settings.best_effort_determinism)
-        applied, warning = strategy.apply(parser, settings.seed)
+        return self.parse_documents_batch([document], settings, budget)[0]
+
+    def parse_documents_batch(
+        self,
+        documents: list[DocumentInput],
+        settings: OcrSettings,
+        budget: ExecutionBudget,
+    ) -> list[ProviderParseResult]:
+        if not documents:
+            return []
+        self.begin_run(settings, budget)
+        if self._parser is None:
+            raise RuntimeError("GLM-OCR parser is not initialized.")
+
         started_at = datetime.now(UTC)
-        try:
-            with tempfile.NamedTemporaryFile(
-                suffix=Path(document.display_name).suffix,
-                delete=False,
-            ) as handle:
-                handle.write(document.raw_bytes)
-                temp_path = Path(handle.name)
-            result = parser.parse(temp_path, save_layout_visualization=False, preserve_order=True)
-        finally:
-            parser.close()
-            if "temp_path" in locals():
-                temp_path.unlink(missing_ok=True)
-        finished_at = datetime.now(UTC)
-        raw_payload = self._raw_payload(result)
-        canonical_result = normalize_glm_payload(raw_payload)
-        warnings = [warning] if warning else []
-        provider_metadata = self.provider_metadata() | {"determinism_applied": applied}
-        return ProviderParseResult(
-            provider_name="glm",
-            provider_version=str(provider_metadata["provider_version"]),
-            provider_metadata=provider_metadata,
-            raw_payload=raw_payload,
-            canonical_result=canonical_result,
-            warnings=warnings,
-            started_at=started_at,
-            finished_at=finished_at,
+        results = self._parser.parse(
+            [document.raw_bytes for document in documents],
+            stream=True,
+            save_layout_visualization=settings.save_layout_visualization,
+            preserve_order=True,
         )
+        provider_metadata = self.provider_metadata() | {
+            "determinism_applied": self._parser_applied,
+            "api_mode": settings.api_mode,
+            "api_path": settings.api_path,
+            "layout_use_polygon": settings.layout_use_polygon,
+            "pdf_dpi": settings.pdf_dpi,
+        }
+        warnings = [self._parser_warning] if self._parser_warning else []
+        provider_results: list[ProviderParseResult] = []
+        for result in results:
+            finished_at = datetime.now(UTC)
+            raw_payload = self._raw_payload(result)
+            canonical_result = normalize_glm_payload(raw_payload)
+            provider_results.append(
+                ProviderParseResult(
+                    provider_name="glm",
+                    provider_version=str(provider_metadata["provider_version"]),
+                    provider_metadata=provider_metadata,
+                    raw_payload=raw_payload,
+                    canonical_result=canonical_result,
+                    warnings=list(warnings),
+                    started_at=started_at,
+                    finished_at=finished_at,
+                )
+            )
+        return provider_results
 
     def _import_glmocr(self) -> Any:
         try:

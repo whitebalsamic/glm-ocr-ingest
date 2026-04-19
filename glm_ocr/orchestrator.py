@@ -7,6 +7,7 @@ import socket
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -71,6 +72,9 @@ def parse_documents(
     discovered_paths = source.discovered_paths(max_documents=budget.max_documents)
     if not discovered_paths:
         raise RuntimeError("No supported files found.")
+    documents = list(source.iter_documents())
+    if budget.max_documents is not None:
+        documents = documents[: budget.max_documents]
 
     provider_info = provider.provider_metadata()
     summary = RunSummary(
@@ -87,6 +91,11 @@ def parse_documents(
         execution_context=execution_context,
         warnings=list(provider_warnings),
         counts={"discovered": len(discovered_paths), "processed": 0, "failed": 0, "skipped": 0},
+        telemetry={
+            "batch_documents": budget.batch_documents,
+            "provider_max_workers": budget.provider_max_workers,
+            "parser_initializations": 0,
+        },
     )
     store = PostgresResultStore(database_url, db_schema) if database_url else None
     if store:
@@ -95,99 +104,140 @@ def parse_documents(
     failures = 0
     skipped = 0
     processed = 0
+    parse_started = datetime.now(UTC)
 
-    for document in source.iter_documents():
-        completed_count = processed + failures + skipped
-        if budget.max_documents is not None and completed_count >= budget.max_documents:
-            break
-        compatibility_ref = None
-        try:
-            result_id = stable_result_id(run_id, document.logical_source_id)
-            compatibility_path = sink.compatibility_json_path(document.logical_source_id)
-            if compatibility_path.exists() and not overwrite:
-                skipped += 1
-                summary.counts["skipped"] = skipped
+    try:
+        if hasattr(provider, "begin_run"):
+            provider.begin_run(settings, budget)
+        for batch in _chunked(documents, max(1, budget.batch_documents)):
+            pending: list[tuple[Any, DocumentIdentity]] = []
+            skipped += _register_skipped_documents(
+                batch=batch,
+                sink=sink,
+                overwrite=overwrite,
+                summary=summary,
+            )
+            summary.counts["skipped"] = skipped
+            for document in batch:
+                compatibility_path = sink.compatibility_json_path(document.logical_source_id)
+                if compatibility_path.exists() and not overwrite:
+                    continue
+                pending.append((document, _identity_for_document(document)))
+            if not pending:
+                continue
+            batch_started = datetime.now(UTC)
+            try:
+                if hasattr(provider, "parse_documents_batch"):
+                    provider_results = provider.parse_documents_batch(
+                        [document for document, _identity in pending],
+                        settings,
+                        budget,
+                    )
+                else:
+                    provider_results = [
+                        provider.parse_document(document, settings, budget)
+                        for document, _identity in pending
+                    ]
+            except Exception as exc:  # noqa: BLE001
+                for document, _identity in pending:
+                    failures += 1
+                    summary.counts["failed"] = failures
+                    summary.warnings.append(f"{document.logical_source_id}: {exc}")
+                    summary.documents.append(
+                        {
+                            "logical_source_id": document.logical_source_id,
+                            "status": "error",
+                            "error": str(exc),
+                            "compatibility_path": None,
+                        }
+                    )
                 continue
 
-            sha256 = sha256_bytes(document.raw_bytes)
-            identity = DocumentIdentity(
-                document_id=stable_document_id(sha256),
-                sha256=sha256,
-                byte_size=len(document.raw_bytes),
-                mime_type=document.mime_type,
-                file_extension=document.source_metadata.get("extension"),
-                display_name=document.display_name,
-                logical_source_id=document.logical_source_id,
-                source_metadata=document.source_metadata,
-            )
-            provider_result = provider.parse_document(document, settings, budget)
-            raw_sdk_json = provider_result.raw_payload.get(
-                "json_result", provider_result.raw_payload
-            )
-            compatibility_ref = sink.write_compatibility_json(
-                document.logical_source_id,
-                raw_sdk_json,
-                overwrite=overwrite,
-            )
-            record_ref = sink.record_ref(run_id, document.logical_source_id)
-            manifest = RecordManifest(
-                artifact_manifest_version=ARTIFACT_MANIFEST_VERSION,
-                run_id=run_id,
-                result_id=result_id,
-                provider_contract_version=PROVIDER_CONTRACT_VERSION,
-                canonical_schema_version=CANONICAL_SCHEMA_VERSION,
-                run_metadata={
-                    "status": "completed",
-                    "provider_name": provider_result.provider_name,
-                    "provider_version": provider_result.provider_version,
-                    "settings_hash": settings_hash(settings),
-                },
-                document_identity=identity,
-                ocr_settings=settings,
-                provider_metadata=provider_result.provider_metadata,
-                canonical_result=provider_result.canonical_result,
-                raw_provider_payload=provider_result.raw_payload,
-                warnings=provider_result.warnings,
-                artifact_refs=[compatibility_ref, record_ref],
-                provenance={
-                    "execution_context": serialize(execution_context),
-                    "logical_source_id": document.logical_source_id,
-                },
-                timings={
-                    "started_at": provider_result.started_at,
-                    "finished_at": provider_result.finished_at,
-                },
-            )
-            sink.write_record(manifest)
-            if store:
-                store.persist_result(summary, manifest)
-            processed += 1
-            summary.counts["processed"] = processed
-            summary.documents.append(
-                {
-                    "logical_source_id": document.logical_source_id,
-                    "result_id": result_id,
-                    "status": "ok",
-                    "artifact_refs": [serialize(ref) for ref in manifest.artifact_refs],
-                }
-            )
-        except Exception as exc:  # noqa: BLE001
-            failures += 1
-            summary.counts["failed"] = failures
-            summary.warnings.append(f"{document.logical_source_id}: {exc}")
-            summary.documents.append(
-                {
-                    "logical_source_id": document.logical_source_id,
-                    "status": "error",
-                    "error": str(exc),
-                    "compatibility_path": None
-                    if compatibility_ref is None
-                    else compatibility_ref.path,
-                }
-            )
+            for (document, identity), provider_result in zip(
+                pending, provider_results, strict=True
+            ):
+                compatibility_ref = None
+                try:
+                    result_id = stable_result_id(run_id, document.logical_source_id)
+                    raw_sdk_json = provider_result.raw_payload.get(
+                        "json_result", provider_result.raw_payload
+                    )
+                    compatibility_ref = sink.write_compatibility_json(
+                        document.logical_source_id,
+                        raw_sdk_json,
+                        overwrite=overwrite,
+                    )
+                    record_ref = sink.record_ref(run_id, document.logical_source_id)
+                    document_finished = provider_result.finished_at or datetime.now(UTC)
+                    document_started = provider_result.started_at or batch_started
+                    manifest = RecordManifest(
+                        artifact_manifest_version=ARTIFACT_MANIFEST_VERSION,
+                        run_id=run_id,
+                        result_id=result_id,
+                        provider_contract_version=PROVIDER_CONTRACT_VERSION,
+                        canonical_schema_version=CANONICAL_SCHEMA_VERSION,
+                        run_metadata={
+                            "status": "completed",
+                            "provider_name": provider_result.provider_name,
+                            "provider_version": provider_result.provider_version,
+                            "settings_hash": settings_hash(settings),
+                        },
+                        document_identity=identity,
+                        ocr_settings=settings,
+                        provider_metadata=provider_result.provider_metadata,
+                        canonical_result=provider_result.canonical_result,
+                        raw_provider_payload=provider_result.raw_payload,
+                        warnings=provider_result.warnings,
+                        artifact_refs=[compatibility_ref, record_ref],
+                        provenance={
+                            "execution_context": serialize(execution_context),
+                            "logical_source_id": document.logical_source_id,
+                        },
+                        timings={
+                            "started_at": document_started,
+                            "finished_at": document_finished,
+                        },
+                    )
+                    sink.write_record(manifest)
+                    if store:
+                        store.persist_result(summary, manifest)
+                    processed += 1
+                    summary.counts["processed"] = processed
+                    summary.documents.append(
+                        {
+                            "logical_source_id": document.logical_source_id,
+                            "result_id": result_id,
+                            "status": "ok",
+                            "artifact_refs": [serialize(ref) for ref in manifest.artifact_refs],
+                            "parse_seconds": (document_finished - document_started).total_seconds(),
+                        }
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    failures += 1
+                    summary.counts["failed"] = failures
+                    summary.warnings.append(f"{document.logical_source_id}: {exc}")
+                    summary.documents.append(
+                        {
+                            "logical_source_id": document.logical_source_id,
+                            "status": "error",
+                            "error": str(exc),
+                            "compatibility_path": None
+                            if compatibility_ref is None
+                            else compatibility_ref.path,
+                        }
+                    )
+    finally:
+        if hasattr(provider, "run_telemetry"):
+            summary.telemetry.update(provider.run_telemetry())
+        if hasattr(provider, "end_run"):
+            provider.end_run()
 
     summary.status = "completed" if failures == 0 else "completed_with_errors"
     summary.finished_at = datetime.now(UTC)
+    parse_elapsed = (summary.finished_at - parse_started).total_seconds()
+    summary.telemetry["parse_wall_seconds"] = parse_elapsed
+    if processed:
+        summary.telemetry["average_parse_seconds"] = parse_elapsed / processed
     sink.write_run_summary(summary)
     if store:
         store.upsert_run_summary(summary)
@@ -319,6 +369,50 @@ def _record_from_dict(data: dict[str, Any]) -> RecordManifest:
         provenance=data.get("provenance", {}),
         timings=data.get("timings", {}),
     )
+
+
+def _identity_for_document(document: Any) -> DocumentIdentity:
+    sha256 = sha256_bytes(document.raw_bytes)
+    return DocumentIdentity(
+        document_id=stable_document_id(sha256),
+        sha256=sha256,
+        byte_size=len(document.raw_bytes),
+        mime_type=document.mime_type,
+        file_extension=document.source_metadata.get("extension"),
+        display_name=document.display_name,
+        logical_source_id=document.logical_source_id,
+        source_metadata=document.source_metadata,
+    )
+
+
+def _register_skipped_documents(
+    *,
+    batch: list[Any],
+    sink: LocalArtifactSink,
+    overwrite: bool,
+    summary: RunSummary,
+) -> int:
+    skipped = 0
+    for document in batch:
+        compatibility_path = sink.compatibility_json_path(document.logical_source_id)
+        if compatibility_path.exists() and not overwrite:
+            skipped += 1
+            summary.documents.append(
+                {
+                    "logical_source_id": document.logical_source_id,
+                    "status": "skipped",
+                    "compatibility_path": str(compatibility_path),
+                }
+            )
+    return skipped
+
+
+def _chunked(items: list[Any], size: int) -> list[list[Any]]:
+    iterator = iter(items)
+    chunks: list[list[Any]] = []
+    while chunk := list(islice(iterator, size)):
+        chunks.append(chunk)
+    return chunks
 
 
 def _summary_from_dict(data: dict[str, Any]) -> RunSummary:
