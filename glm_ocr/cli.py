@@ -20,6 +20,7 @@ from .constants import (
     DEFAULT_TOP_K,
     DEFAULT_TOP_P,
 )
+from .evaluate import compare_artifacts_to_ground_truth, render_summary_markdown
 from .models import ExecutionBudget, OcrSettings
 from .orchestrator import build_execution_context, doctor_checks, parse_documents, replay_artifacts
 from .providers.glm_provider import GlmOcrProvider
@@ -41,6 +42,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     replay_parser.add_argument("--database-url", default=os.environ.get("DATABASE_URL"))
     replay_parser.add_argument("--db-schema", default="public")
+
+    compare_parser = subparsers.add_parser(
+        "compare",
+        help="Compare artifact output against dataset ground truth JSON files.",
+    )
+    compare_parser.add_argument("dataset_dir", type=Path)
+    compare_parser.add_argument("artifact_dir", type=Path)
+    compare_parser.add_argument("--report-path", type=Path)
 
     doctor_parser = subparsers.add_parser("doctor", help="Validate local runtime dependencies.")
     _add_provider_arguments(doctor_parser)
@@ -92,7 +101,7 @@ def _add_parse_arguments(parser: argparse.ArgumentParser) -> None:
 def _coerce_legacy_parse(argv: list[str]) -> list[str]:
     if not argv:
         return argv
-    if argv[0] in {"parse", "replay", "doctor", "-h", "--help"}:
+    if argv[0] in {"parse", "replay", "compare", "doctor", "-h", "--help"}:
         return argv
     return ["parse", *argv]
 
@@ -127,6 +136,7 @@ def main(argv: list[str] | None = None) -> int:
     legacy_mode = bool(raw_argv) and raw_argv[0] not in {
         "parse",
         "replay",
+        "compare",
         "doctor",
         "-h",
         "--help",
@@ -144,6 +154,15 @@ def main(argv: list[str] | None = None) -> int:
             path=args.path, database_url=args.database_url, db_schema=args.db_schema
         )
         print(json.dumps(result, indent=2))
+        return 0
+
+    if args.command == "compare":
+        report = compare_artifacts_to_ground_truth(
+            dataset_dir=args.dataset_dir,
+            artifact_dir=args.artifact_dir,
+            report_path=args.report_path,
+        )
+        print(render_summary_markdown(report["summary"]))
         return 0
 
     settings = _settings_from_args(args)
