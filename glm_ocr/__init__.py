@@ -1,0 +1,13 @@
+"""Sandbox-ready GLM-OCR wrapper package."""
+
+from .constants import (
+    ARTIFACT_MANIFEST_VERSION,
+    CANONICAL_SCHEMA_VERSION,
+    PROVIDER_CONTRACT_VERSION,
+)
+
+__all__ = [
+    "ARTIFACT_MANIFEST_VERSION",
+    "CANONICAL_SCHEMA_VERSION",
+    "PROVIDER_CONTRACT_VERSION",
+]

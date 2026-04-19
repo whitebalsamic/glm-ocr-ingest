@@ -1,0 +1,25 @@
+name: Bug report
+description: Report a reproducible defect in glm-ocr-ingest
+labels: ["bug"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What broke, and what did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Provide the smallest set of steps, inputs, or sample files needed to reproduce the issue.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include Python version, OS, provider settings, and any relevant database configuration.
+    validations:
+      required: true
