@@ -133,3 +133,45 @@ def test_compare_cli_writes_default_report(tmp_path: Path) -> None:
 
     assert exit_code == 0
     assert (artifact_dir / "_evaluation" / "comparison_report.json").exists()
+
+
+def test_benchmark_cli_writes_metrics(tmp_path: Path, monkeypatch) -> None:
+    dataset_dir = tmp_path / "dataset"
+    dataset_dir.mkdir()
+    artifact_dir = tmp_path / "artifacts"
+    manifest_path = tmp_path / "cluster.json"
+    metrics_path = tmp_path / "metrics.json"
+
+    manifest_path.write_text(
+        json.dumps({"name": "cluster10", "stems": ["invoice"]}), encoding="utf-8"
+    )
+
+    def fake_run_benchmark(**kwargs):  # noqa: ANN003
+        del kwargs
+        metrics_path.write_text(json.dumps({"exact_matches": 1}), encoding="utf-8")
+
+        class Result:
+            metrics = {"exact_matches": 1}
+
+        return Result()
+
+    monkeypatch.setattr(cli, "run_benchmark", fake_run_benchmark)
+
+    exit_code = cli.main(
+        [
+            "benchmark",
+            str(dataset_dir),
+            str(artifact_dir),
+            "--database-url",
+            "postgresql://example",
+            "--db-schema",
+            "bench_schema",
+            "--cluster-manifest",
+            str(manifest_path),
+            "--metrics-path",
+            str(metrics_path),
+        ]
+    )
+
+    assert exit_code == 0
+    assert json.loads(metrics_path.read_text())["exact_matches"] == 1

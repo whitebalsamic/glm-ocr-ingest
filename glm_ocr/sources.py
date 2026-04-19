@@ -57,3 +57,36 @@ class LocalPathDocumentSource:
         if max_documents is not None:
             return paths[:max_documents]
         return paths
+
+
+@dataclass(slots=True)
+class ExplicitPathDocumentSource:
+    source_root: Path
+    paths: list[Path]
+
+    def iter_paths(self) -> Iterator[Path]:
+        for path in sorted(self.paths):
+            validate_supported(path)
+            yield path
+
+    def iter_documents(self) -> Iterator[DocumentInput]:
+        for path in self.iter_paths():
+            stat = path.stat()
+            relative = safe_relative_path(self.source_root, path)
+            yield DocumentInput(
+                raw_bytes=path.read_bytes(),
+                display_name=path.name,
+                logical_source_id=str(relative),
+                mime_type=detect_mime_type(path.name),
+                source_metadata={
+                    "absolute_path": str(path.resolve()),
+                    "mtime": stat.st_mtime,
+                    "extension": path.suffix.lower(),
+                },
+            )
+
+    def discovered_paths(self, max_documents: int | None = None) -> list[Path]:
+        paths = list(self.iter_paths())
+        if max_documents is not None:
+            return paths[:max_documents]
+        return paths

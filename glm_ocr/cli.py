@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 
 from .artifacts import LocalArtifactSink
+from .benchmark import run_benchmark
 from .config_defaults import default_layout_device
 from .constants import (
     DEFAULT_MODEL,
@@ -51,6 +52,19 @@ def build_parser() -> argparse.ArgumentParser:
     compare_parser.add_argument("artifact_dir", type=Path)
     compare_parser.add_argument("--report-path", type=Path)
 
+    benchmark_parser = subparsers.add_parser(
+        "benchmark",
+        help="Run parse plus compare for a deterministic document cluster.",
+    )
+    benchmark_parser.add_argument("dataset_dir", type=Path)
+    benchmark_parser.add_argument("artifact_dir", type=Path)
+    benchmark_parser.add_argument("--database-url", default=os.environ.get("DATABASE_URL"))
+    benchmark_parser.add_argument("--db-schema", required=True)
+    benchmark_parser.add_argument("--cluster-manifest", type=Path, required=True)
+    benchmark_parser.add_argument("--metrics-path", type=Path, required=True)
+    _add_provider_arguments(benchmark_parser)
+    benchmark_parser.add_argument("--batch-documents", type=int, default=1)
+
     doctor_parser = subparsers.add_parser("doctor", help="Validate local runtime dependencies.")
     _add_provider_arguments(doctor_parser)
     doctor_parser.add_argument("-o", "--output-dir", type=Path, required=True)
@@ -84,6 +98,11 @@ def _add_provider_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--allow-untested-provider", action="store_true")
     parser.add_argument("--best-effort-determinism", action="store_true")
     parser.add_argument("--provider-max-workers", type=int, default=1)
+    parser.add_argument("--api-mode", default="ollama_generate")
+    parser.add_argument("--api-path", default="/api/generate")
+    parser.add_argument("--layout-use-polygon", action="store_true")
+    parser.add_argument("--pdf-dpi", type=int, default=200)
+    parser.add_argument("--save-layout-visualization", action="store_true")
 
 
 def _add_parse_arguments(parser: argparse.ArgumentParser) -> None:
@@ -92,6 +111,7 @@ def _add_parse_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--recursive", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--jobs", type=int, default=1)
+    parser.add_argument("--batch-documents", type=int, default=1)
     parser.add_argument("--max-documents", type=int, default=None)
     parser.add_argument("--database-url", default=os.environ.get("DATABASE_URL"))
     parser.add_argument("--db-schema", default="public")
@@ -101,7 +121,7 @@ def _add_parse_arguments(parser: argparse.ArgumentParser) -> None:
 def _coerce_legacy_parse(argv: list[str]) -> list[str]:
     if not argv:
         return argv
-    if argv[0] in {"parse", "replay", "compare", "doctor", "-h", "--help"}:
+    if argv[0] in {"parse", "replay", "compare", "benchmark", "doctor", "-h", "--help"}:
         return argv
     return ["parse", *argv]
 
@@ -118,6 +138,11 @@ def _settings_from_args(args: argparse.Namespace) -> OcrSettings:
         top_p=args.top_p,
         top_k=args.top_k,
         repeat_penalty=args.repeat_penalty,
+        api_mode=args.api_mode,
+        api_path=args.api_path,
+        layout_use_polygon=args.layout_use_polygon,
+        pdf_dpi=args.pdf_dpi,
+        save_layout_visualization=args.save_layout_visualization,
         allow_untested_provider=args.allow_untested_provider,
         best_effort_determinism=args.best_effort_determinism,
     )
@@ -137,6 +162,7 @@ def main(argv: list[str] | None = None) -> int:
         "parse",
         "replay",
         "compare",
+        "benchmark",
         "doctor",
         "-h",
         "--help",
@@ -168,6 +194,31 @@ def main(argv: list[str] | None = None) -> int:
     settings = _settings_from_args(args)
     provider = _provider_from_args(args)
 
+    if args.command == "benchmark":
+        if not args.database_url:
+            print("--database-url or DATABASE_URL is required for benchmark.")
+            return 1
+        if args.batch_documents < 1 or args.provider_max_workers < 1:
+            print("--batch-documents and --provider-max-workers must be at least 1.")
+            return 1
+        result = run_benchmark(
+            dataset_dir=args.dataset_dir,
+            artifact_dir=args.artifact_dir,
+            cluster_manifest=args.cluster_manifest,
+            metrics_path=args.metrics_path,
+            database_url=args.database_url,
+            db_schema=args.db_schema,
+            provider=provider,
+            settings=settings,
+            budget=ExecutionBudget(
+                jobs=1,
+                provider_max_workers=args.provider_max_workers,
+                batch_documents=args.batch_documents,
+            ),
+        )
+        print(json.dumps(result.metrics, indent=2))
+        return 0
+
     if args.command == "doctor":
         result = doctor_checks(
             provider=provider,
@@ -190,8 +241,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.max_documents is not None and args.max_documents < 1:
         print("--max-documents must be at least 1.")
         return 1
-    if args.jobs < 1 or args.provider_max_workers < 1:
-        print("--jobs and --provider-max-workers must be at least 1.")
+    if args.jobs < 1 or args.provider_max_workers < 1 or args.batch_documents < 1:
+        print("--jobs, --provider-max-workers, and --batch-documents must be at least 1.")
         return 1
 
     source = LocalPathDocumentSource(input_path=args.input_path, recursive=args.recursive)
@@ -199,6 +250,7 @@ def main(argv: list[str] | None = None) -> int:
     budget = ExecutionBudget(
         jobs=args.jobs,
         provider_max_workers=args.provider_max_workers,
+        batch_documents=args.batch_documents,
         max_documents=args.max_documents,
     )
     execution_context = build_execution_context(

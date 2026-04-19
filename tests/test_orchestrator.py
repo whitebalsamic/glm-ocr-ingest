@@ -34,7 +34,7 @@ def test_parse_documents_writes_compatibility_and_record_artifacts(
             top_k=1,
             repeat_penalty=1.0,
         ),
-        budget=ExecutionBudget(),
+        budget=ExecutionBudget(batch_documents=2),
         execution_context=build_execution_context("parse", str(tmp_path), None),
         overwrite=False,
         database_url=None,
@@ -47,6 +47,10 @@ def test_parse_documents_writes_compatibility_and_record_artifacts(
     record_path = next((output_dir / "_records").glob("**/*.record.json"))
     assert run_summary_path.exists()
     assert record_path.exists()
+    assert outcome.run_summary.telemetry["parser_initializations"] == 1
+    assert fake_provider.begin_calls == 1
+    assert fake_provider.end_calls == 1
+    assert fake_provider.batch_calls == 1
 
 
 def test_parse_documents_skips_existing_compatibility_artifact(

@@ -72,19 +72,76 @@ SUMMARY_LABELS = {
     "totalAmount": ("total amount", "amount due", "total due", "invoice total", "total"),
 }
 LINE_ITEM_HEADERS = {
-    "description": ("description", "product/description", "product description", "details"),
-    "quantity": ("quantity", "qty"),
-    "unitPrice": ("unit price", "price", "unit cost", "rate"),
-    "amount": ("ext. price", "extended price", "amount", "line total", "total"),
+    "description": (
+        "description",
+        "product/description",
+        "product description",
+        "product",
+        "item description",
+        "item",
+        "service",
+        "details",
+        "particulars",
+    ),
+    "quantity": (
+        "quantity",
+        "qty",
+        "# of broadcasts",
+        "broadcasts",
+        "# of spots",
+        "spots",
+        "units",
+    ),
+    "unitPrice": ("unit price", "unit amount", "price", "unit cost", "rate"),
+    "amount": (
+        "ext. price",
+        "extended price",
+        "ext price",
+        "extension",
+        "extension amount",
+        "amount",
+        "line total",
+        "total",
+    ),
     "tax": ("tax",),
     "taxRate": ("tax rate", "vat %", "tax %", "rate %"),
     "sku": ("sku",),
-    "itemCode": ("item code", "code", "item no", "item #", "product code"),
+    "itemCode": (
+        "item code",
+        "code",
+        "item no",
+        "item #",
+        "product code",
+        "line #",
+        "line no",
+        "line number",
+        "reference",
+        "reference #",
+    ),
 }
 LABEL_SYNONYMS = {
     "invoiceNumber": ("invoice number", "invoice no", "invoice #", "inv no", "inv #"),
     "invoiceDate": ("invoice date", "date"),
     "customerName": ("bill to", "sold to", "customer", "customer name"),
+}
+TABLE_FIELD_LABELS = {
+    "invoiceNumber": ("invoice number", "invoice #", "invoice no", "document number", "number"),
+    "invoiceDate": ("invoice date", "document date", "date"),
+    "sellerName": (
+        "seller",
+        "vendor",
+        "property",
+        "send payment to",
+        "remit to",
+        "from",
+        "in account with",
+    ),
+    "customerName": ("bill to", "sold to", "customer", "account", "advertiser", "to"),
+    "subtotal": ("subtotal", "sub total"),
+    "tax": ("tax", "vat"),
+    "discount": ("discount",),
+    "shipping": ("shipping", "freight", "delivery"),
+    "totalAmount": ("invoice total", "total amount", "amount due", "total due", "total"),
 }
 
 
@@ -156,8 +213,11 @@ def compare_artifacts_to_ground_truth(
     dataset_dir: Path,
     artifact_dir: Path,
     report_path: Path | None = None,
+    stems: set[str] | None = None,
 ) -> dict[str, Any]:
     ground_truth = _load_ground_truth(dataset_dir)
+    if stems is not None:
+        ground_truth = {stem: payload for stem, payload in ground_truth.items() if stem in stems}
     records = _load_record_manifests(artifact_dir)
     run_summary = _load_latest_run_summary(artifact_dir)
     output_paths = _resolve_output_paths(artifact_dir, report_path)
@@ -298,24 +358,57 @@ def extract_invoice_view(manifest: dict[str, Any]) -> dict[str, Any]:
     else:
         markdown_text = _fallback_text_from_manifest(manifest)
     lines = _extract_text_lines(markdown_text)
+    region_lines = _extract_region_lines(manifest)
+    merged_lines = _unique_lines(lines + region_lines)
     tables = _extract_tables(markdown_text)
-    searchable_text = _searchable_text(markdown_text)
+    table_pairs = _extract_table_pairs(tables)
+    line_pairs = _extract_line_pairs(merged_lines)
+    searchable_text = _searchable_text("\n".join(merged_lines))
 
     line_items = _extract_line_items(tables)
-    summary = _extract_summary_fields(lines, searchable_text, line_items)
+    summary = _extract_summary_fields(
+        merged_lines,
+        searchable_text,
+        line_items,
+        table_pairs=table_pairs,
+        line_pairs=line_pairs,
+    )
     document = {
-        "invoiceNumber": _extract_labeled_field(lines, "invoiceNumber"),
-        "invoiceDate": _extract_labeled_field(lines, "invoiceDate"),
-        "sellerName": _extract_seller_name(lines),
-        "customerName": _extract_customer_name(lines),
-        "currency": _extract_currency(searchable_text),
-        "country": _extract_country(lines),
+        "invoiceNumber": _extract_labeled_field(
+            merged_lines,
+            "invoiceNumber",
+            table_pairs=table_pairs,
+            line_pairs=line_pairs,
+        ),
+        "invoiceDate": _extract_labeled_field(
+            merged_lines,
+            "invoiceDate",
+            table_pairs=table_pairs,
+            line_pairs=line_pairs,
+        ),
+        "sellerName": _extract_seller_name(
+            merged_lines,
+            table_pairs=table_pairs,
+            line_pairs=line_pairs,
+        ),
+        "customerName": _extract_customer_name(
+            merged_lines,
+            table_pairs=table_pairs,
+            line_pairs=line_pairs,
+        ),
+        "currency": _extract_currency(
+            searchable_text,
+            summary=summary,
+            line_items=line_items,
+        ),
+        "country": _extract_country(merged_lines),
     }
     return {
         "document": document,
         "summary": summary,
         "lineItems": line_items,
         "_search_text": searchable_text,
+        "_provenance": {"table_pairs": table_pairs, "line_pairs": line_pairs},
     }
 
 
@@ -422,44 +515,141 @@ def _extract_tables(markdown_text: str) -> list[TableData]:
     return parser.tables
 
 
-def _extract_labeled_field(lines: list[str], field_name: str) -> dict[str, Any]:
+def _extract_region_lines(manifest: dict[str, Any]) -> list[str]:
+    pages = manifest.get("canonical_result", {}).get("pages", [])
+    lines: list[str] = []
+    for page in pages:
+        for region in page.get("regions", []):
+            content = region.get("content")
+            if isinstance(content, str) and content.strip():
+                lines.extend(_extract_text_lines(content))
+    return lines
+
+
+def _extract_table_pairs(tables: list[TableData]) -> dict[str, list[str]]:
+    pairs: dict[str, list[str]] = {}
+    for table in tables:
+        if table.headers and table.rows and len(table.headers) == len(table.rows[0]):
+            for header, value in zip(table.headers, table.rows[0], strict=False):
+                _append_pair(pairs, header, value)
+            remaining_rows = table.rows[1:]
+        else:
+            remaining_rows = table.rows
+        all_rows = [table.headers, *table.rows]
+        single_column_rows = [row[0] for row in all_rows if len(row) == 1 and row[0]]
+        if len(single_column_rows) >= 2 and len(single_column_rows) == len(all_rows):
+            for index in range(0, len(single_column_rows) - 1, 2):
+                _append_pair(pairs, single_column_rows[index], single_column_rows[index + 1])
+            continue
+        for row in remaining_rows:
+            cells = [cell for cell in row if cell]
+            if len(cells) == 2:
+                _append_pair(pairs, cells[0], cells[1])
+                continue
+            if len(cells) % 2 == 0 and not table.headers:
+                for index in range(0, len(cells), 2):
+                    _append_pair(pairs, cells[index], cells[index + 1])
+    return pairs
+
+
+def _extract_line_pairs(lines: list[str]) -> dict[str, list[str]]:
+    pairs: dict[str, list[str]] = {}
+    for index, line in enumerate(lines):
+        for labels in TABLE_FIELD_LABELS.values():
+            matched_label = next(
+                (label for label in labels if _line_has_explicit_label(line, label)),
+                None,
+            )
+            if matched_label is None:
+                continue
+            value = _value_after_label(line, labels)
+            if value:
+                _append_pair(pairs, matched_label, value)
+                continue
+            block = _block_after_label(
+                lines,
+                index=index,
+                labels=labels,
+                max_lines=3 if labels == TABLE_FIELD_LABELS["customerName"] else 1,
+            )
+            if block:
+                _append_pair(pairs, matched_label, block)
+    return pairs
+
+
+def _extract_labeled_field(
+    lines: list[str],
+    field_name: str,
+    *,
+    table_pairs: dict[str, list[str]] | None = None,
+    line_pairs: dict[str, list[str]] | None = None,
+) -> dict[str, Any]:
+    for pairs in (table_pairs, line_pairs):
+        candidate = _field_from_pairs(field_name, pairs)
+        if candidate["status"] == "present":
+            return candidate
     labels = LABEL_SYNONYMS[field_name]
     for index, line in enumerate(lines):
-        lowered = line.casefold()
-        if any(label in lowered for label in labels):
-            for offset in range(0, 4):
-                position = index + offset
-                if position >= len(lines):
-                    break
-                candidate_line = lines[position]
-                if position == index:
-                    candidate = _value_after_label(candidate_line, labels)
-                    if candidate is not None:
-                        return _present_field(field_name, candidate)
-                    continue
-                if _looks_like_label_only(candidate_line):
-                    continue
-                return _present_field(field_name, candidate_line)
+        if not any(_line_has_explicit_label(line, label) for label in labels):
+            continue
+        max_lines = 1 if field_name in {"invoiceNumber", "invoiceDate"} else 2
+        block = _block_after_label(lines, index=index, labels=labels, max_lines=max_lines)
+        if block:
+            return _present_field(field_name, block)
     return _absent_field()
 
 
-def _extract_seller_name(lines: list[str]) -> dict[str, Any]:
+def _extract_seller_name(
+    lines: list[str],
+    *,
+    table_pairs: dict[str, list[str]] | None = None,
+    line_pairs: dict[str, list[str]] | None = None,
+) -> dict[str, Any]:
+    for pairs in (table_pairs, line_pairs):
+        candidate = _field_from_pairs("sellerName", pairs)
+        if candidate["status"] == "present":
+            return _party_field("sellerName", candidate["raw"])
     for line in lines:
         lowered = line.casefold()
-        if any(token in lowered for token in ("invoice", "bill to", "sold to", "customer")):
+        if any(
+            token in lowered
+            for token in (
+                "invoice",
+                "bill to",
+                "sold to",
+                "ship to",
+                "customer",
+                "advertiser",
+                "account",
+                "sold ",
+                "ship ",
+                "send payment to",
+                "remit to",
+            )
+        ):
             break
         if any(char.isdigit() for char in line):
             continue
         if len(line.split()) < 2:
             continue
-        return _present_field("sellerName", line)
+        return _party_field("sellerName", line)
     return _absent_field()
 
 
-def _extract_customer_name(lines: list[str]) -> dict[str, Any]:
-    labeled = _extract_labeled_field(lines, "customerName")
+def _extract_customer_name(
+    lines: list[str],
+    *,
+    table_pairs: dict[str, list[str]] | None = None,
+    line_pairs: dict[str, list[str]] | None = None,
+) -> dict[str, Any]:
+    labeled = _extract_labeled_field(
+        lines,
+        "customerName",
+        table_pairs=table_pairs,
+        line_pairs=line_pairs,
+    )
     if labeled["status"] == "present":
-        return labeled
+        return _party_field("customerName", labeled["raw"])
     invoice_index = next(
         (idx for idx, line in enumerate(lines) if "invoice number" in line.casefold()),
         len(lines),
@@ -479,14 +669,34 @@ def _extract_customer_name(lines: list[str]) -> dict[str, Any]:
         if len(line.split()) < 2:
             continue
         if line.isupper() or sum(ch.isupper() for ch in line) >= max(4, len(line) // 3):
-            return _present_field("customerName", line.split("ATTN:")[0].strip())
+            if line.casefold() in {"in account with", "invoice", "to"}:
+                continue
+            return _party_field("customerName", line.split("ATTN:")[0].strip())
     return _absent_field()
 
 
-def _extract_currency(searchable_text: str) -> dict[str, Any]:
+def _extract_currency(
+    searchable_text: str,
+    *,
+    summary: dict[str, dict[str, Any]],
+    line_items: list[dict[str, Any]],
+) -> dict[str, Any]:
     for symbol in ("$", "EUR", "€", "GBP", "£"):
         if symbol.casefold() in searchable_text:
             return _present_field("currency", symbol)
+    for field_name in ("subtotal", "tax", "shipping", "totalAmount"):
+        raw = summary.get(field_name, {}).get("raw")
+        if isinstance(raw, str):
+            for symbol in ("$", "€", "£"):
+                if symbol in raw:
+                    return _present_field("currency", symbol)
+    for item in line_items:
+        for field_name in ("unitPrice", "amount", "tax"):
+            raw = item.get(field_name, {}).get("raw")
+            if isinstance(raw, str):
+                for symbol in ("$", "€", "£"):
+                    if symbol in raw:
+                        return _present_field("currency", symbol)
     return _absent_field()
 
 
@@ -502,10 +712,19 @@ def _extract_summary_fields(
     lines: list[str],
     searchable_text: str,
     line_items: list[dict[str, Any]],
+    *,
+    table_pairs: dict[str, list[str]] | None = None,
+    line_pairs: dict[str, list[str]] | None = None,
 ) -> dict[str, dict[str, Any]]:
     result: dict[str, dict[str, Any]] = {}
     for field_name, labels in SUMMARY_LABELS.items():
-        result[field_name] = _extract_summary_field(lines, field_name, labels)
+        result[field_name] = _extract_summary_field(
+            lines,
+            field_name,
+            labels,
+            table_pairs=table_pairs,
+            line_pairs=line_pairs,
+        )
     if result["totalAmount"]["status"] == "absent":
         amounts: list[Decimal] = []
         for item in line_items:
@@ -527,10 +746,16 @@ def _extract_summary_field(
     lines: list[str],
     field_name: str,
     labels: tuple[str, ...],
+    *,
+    table_pairs: dict[str, list[str]] | None = None,
+    line_pairs: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
+    for pairs in (table_pairs, line_pairs):
+        candidate = _field_from_pairs(field_name, pairs)
+        if candidate["status"] == "present":
+            return candidate
     for index, line in enumerate(lines):
-        lowered = line.casefold()
-        if not any(label in lowered for label in labels):
+        if not any(_line_has_explicit_label(line, label) for label in labels):
             continue
         candidate = _value_after_label(line, labels)
         if candidate:
@@ -544,16 +769,20 @@ def _extract_line_items(tables: list[TableData]) -> list[dict[str, Any]]:
     if not tables:
         return []
     candidate_rows: list[dict[str, Any]] = []
-    best_score = -1
+    seen_row_texts: set[str] = set()
     for table in tables:
         headers, rows = _normalize_table_headers(table)
         if not headers:
             continue
         mapping = _column_mapping(headers)
-        score = len(mapping)
-        if score > best_score:
-            best_score = score
-            candidate_rows = _rows_to_line_items(rows, mapping)
+        if not _is_line_item_candidate(mapping):
+            continue
+        for item in _rows_to_line_items(rows, mapping):
+            row_text = item.get("_row_text", "")
+            if not row_text or row_text in seen_row_texts:
+                continue
+            seen_row_texts.add(row_text)
+            candidate_rows.append(item)
     return candidate_rows
 
 
@@ -579,12 +808,26 @@ def _column_mapping(headers: list[str]) -> dict[str, int]:
     mapping: dict[str, int] = {}
     for index, header in enumerate(headers):
         lowered = _collapse_ws(header).casefold()
+        best_field: str | None = None
+        best_alias_length = -1
         for field_name, aliases in LINE_ITEM_HEADERS.items():
             if field_name in mapping:
                 continue
-            if any(alias in lowered for alias in aliases):
-                mapping[field_name] = index
+            alias_length = max((len(alias) for alias in aliases if alias in lowered), default=-1)
+            if alias_length > best_alias_length:
+                best_field = field_name
+                best_alias_length = alias_length
+        if best_field is not None:
+            mapping[best_field] = index
     return mapping
+
+
+def _is_line_item_candidate(mapping: dict[str, int]) -> bool:
+    if len(mapping) < 2:
+        return False
+    has_descriptor = any(field in mapping for field in ("description", "itemCode", "sku"))
+    has_measure = any(field in mapping for field in ("amount", "unitPrice", "quantity"))
+    return has_descriptor and has_measure
 
 
 def _rows_to_line_items(rows: list[list[str]], mapping: dict[str, int]) -> list[dict[str, Any]]:
@@ -615,9 +858,139 @@ def _rows_to_line_items(rows: list[list[str]], mapping: dict[str, int]) -> list[
                     item["sku"] = _present_field("sku", code)
                 if item["itemCode"]["status"] == "absent":
                     item["itemCode"] = _present_field("itemCode", code)
+        if item["sku"]["status"] == "absent" and item["itemCode"]["status"] == "present":
+            item["sku"] = _present_field("sku", item["itemCode"]["raw"])
+        if item["itemCode"]["status"] == "absent" and item["sku"]["status"] == "present":
+            item["itemCode"] = _present_field("itemCode", item["sku"]["raw"])
+        if (
+            item["amount"]["status"] == "absent"
+            and item["quantity"]["status"] == "present"
+            and item["unitPrice"]["status"] == "present"
+        ):
+            try:
+                quantity = Decimal(str(item["quantity"]["value"]))
+                unit_price = Decimal(str(item["unitPrice"]["value"]))
+            except InvalidOperation:
+                pass
+            else:
+                item["amount"] = _present_field("amount", str(quantity * unit_price))
         if meaningful:
             items.append(item)
     return items
+
+
+def _field_from_pairs(
+    field_name: str,
+    pairs: dict[str, list[str]] | None,
+) -> dict[str, Any]:
+    if not pairs:
+        return _absent_field()
+    labels = TABLE_FIELD_LABELS.get(field_name, ())
+    for label in sorted(labels, key=len, reverse=True):
+        normalized_label = _normalize_label(label)
+        values = pairs.get(normalized_label, [])
+        for value in values:
+            if value:
+                return _present_field(field_name, value)
+    return _absent_field()
+
+
+def _party_field(field_name: str, raw_value: str) -> dict[str, Any]:
+    cleaned = _party_name_block(raw_value)
+    return _present_field(field_name, cleaned)
+
+
+def _append_pair(pairs: dict[str, list[str]], key: str, value: str) -> None:
+    normalized = _normalize_label(key)
+    cleaned_value = _collapse_ws(value)
+    if not normalized or not cleaned_value:
+        return
+    pairs.setdefault(normalized, []).append(cleaned_value)
+
+
+def _normalize_label(value: str) -> str:
+    lowered = _collapse_ws(value).casefold()
+    lowered = re.sub(r"[^a-z0-9]+", " ", lowered)
+    return _collapse_ws(lowered)
+
+
+def _line_has_explicit_label(line: str, label: str) -> bool:
+    escaped = re.escape(label)
+    match = re.search(
+        rf"^\s*(?<!\w){escaped}(?!\w)(.*)$",
+        line,
+        flags=re.I,
+    )
+    if not match:
+        return False
+    suffix = match.group(1)
+    if " " not in label and suffix and not re.match(r"^\s*[:#-]", suffix):
+        candidate = _collapse_ws(suffix)
+        if candidate[:1].islower():
+            return False
+    return True
+
+
+def _block_after_label(
+    lines: list[str],
+    *,
+    index: int,
+    labels: tuple[str, ...],
+    max_lines: int,
+) -> str | None:
+    line = lines[index]
+    candidate = _value_after_label(line, labels)
+    if candidate:
+        return candidate
+    block_lines: list[str] = []
+    for next_line in lines[index + 1 : index + 4]:
+        if _looks_like_label_only(next_line):
+            continue
+        if _is_address_like(next_line):
+            if block_lines:
+                break
+            continue
+        block_lines.append(next_line)
+        if len(block_lines) >= max_lines:
+            break
+    if not block_lines:
+        return None
+    return _collapse_ws(" ".join(block_lines))
+
+
+def _is_address_like(value: str) -> bool:
+    return any(char.isdigit() for char in value) and any(
+        token in value.casefold()
+        for token in ("st", "road", "ave", "suite", "po box", "floor", "ct")
+    )
+
+
+def _party_name_block(value: str) -> str:
+    normalized = re.sub(r"\bP\.?\s*O\.?\s+Box\b", "\nP.O. Box", str(value), flags=re.I)
+    normalized = re.sub(r"\b(\d{1,6}\s+[A-Za-z])", r"\n\1", normalized, count=1)
+    lines = [_collapse_ws(part) for part in normalized.splitlines()]
+    selected: list[str] = []
+    for line in lines:
+        if not line:
+            continue
+        if _is_address_like(line) or re.match(r"^(tel|phone|fax|page)\b", line, flags=re.I):
+            break
+        selected.append(line)
+        if len(selected) >= 3:
+            break
+    return _collapse_ws(" ".join(selected)) if selected else _collapse_ws(str(value))
+
+
+def _unique_lines(lines: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for line in lines:
+        cleaned = _collapse_ws(line)
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        result.append(cleaned)
+    return result
 
 
 def _compare_field(
@@ -705,6 +1078,8 @@ def _value_after_label(line: str, labels: tuple[str, ...]) -> str | None:
         if not match:
             continue
         candidate = _collapse_ws(match.group(1))
+        if " " not in label and ":" not in line and "-" not in line and candidate[:1].islower():
+            continue
         if candidate and not _looks_like_label_only(candidate):
             return candidate
     return None
@@ -752,7 +1127,18 @@ def _normalize_value(field_name: str, value: Any) -> Any:
 
 def _normalize_date_value(value: Any) -> str:
     raw = _collapse_ws(str(value))
-    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%d/%m/%Y", "%d.%m.%Y", "%Y/%m/%d"):
+    for fmt in (
+        "%Y-%m-%d",
+        "%m/%d/%Y",
+        "%m/%d/%y",
+        "%d/%m/%Y",
+        "%d.%m.%Y",
+        "%Y/%m/%d",
+        "%B %d, %Y",
+        "%B %d,%Y",
+        "%b %d, %Y",
+        "%b %d,%Y",
+    ):
         try:
             return datetime.strptime(raw, fmt).date().isoformat()
         except ValueError:

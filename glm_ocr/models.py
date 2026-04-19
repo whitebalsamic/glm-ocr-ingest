@@ -43,6 +43,7 @@ class ExecutionContext:
 class ExecutionBudget:
     jobs: int = 1
     provider_max_workers: int = 1
+    batch_documents: int = 1
     max_documents: int | None = None
 
 
@@ -58,6 +59,11 @@ class OcrSettings:
     top_p: float
     top_k: int
     repeat_penalty: float
+    api_mode: str = "ollama_generate"
+    api_path: str = "/api/generate"
+    layout_use_polygon: bool = False
+    pdf_dpi: int = 200
+    save_layout_visualization: bool = False
     allow_untested_provider: bool = False
     best_effort_determinism: bool = False
 
@@ -124,6 +130,7 @@ class ProviderParseResult:
     warnings: list[str] = field(default_factory=list)
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    source_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -161,3 +168,4 @@ class RunSummary:
     warnings: list[str] = field(default_factory=list)
     counts: dict[str, int] = field(default_factory=dict)
     documents: list[dict[str, Any]] = field(default_factory=list)
+    telemetry: dict[str, Any] = field(default_factory=dict)
